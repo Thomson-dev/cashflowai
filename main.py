@@ -46,11 +46,17 @@ app = FastAPI(
     description="Provides structured financial insights using Gemini + LangChain."
 )
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.3,
-    google_api_key=os.getenv("GOOGLE_API_KEY")
-)
+# Initialize LLM (will be lazy loaded to avoid startup errors)
+def get_llm():
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
+    
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.3,
+        google_api_key=api_key
+    )
 
 
 # -------------------------------------------------------------
@@ -104,9 +110,6 @@ IMPORTANT RULES:
 Respond ONLY with valid JSON, no additional text before or after.
 """
 
-prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-ai_chain = prompt | llm
-
 
 # -------------------------------------------------------------
 # 4. ENDPOINTS
@@ -116,6 +119,7 @@ ai_chain = prompt | llm
 async def root():
     return {
         "message": "CashFlow AI is running",
+        "status": "healthy",
         "endpoints": {
             "POST /ai/insights": "Generate structured financial insights with Gemini",
             "POST /ai/chat": "Chat with financial advisor AI",
@@ -129,13 +133,18 @@ async def health_check():
     return {
         "status": "healthy",
         "api_key_configured": api_key_configured,
-        "model": "gemini-2.5-flash"
+        "model": "gemini-2.5-flash",
+        "port": os.getenv("PORT", "not set")
     }
 
 
 @app.post("/ai/insights", response_model=FinancialInsightsOutput)
 async def generate_ai_insights(data: InsightsInput):
     try:
+        llm = get_llm()
+        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+        ai_chain = prompt | llm
+        
         insights = data.insights
         
         # Extract the key values for the prompt
@@ -227,12 +236,8 @@ async def chat_with_financial_advisor(request: ChatContextRequest):
     Enhanced chatbot that understands user context, transactions, and provides smart suggestions.
     """
     try:
-        # Create chatbot LLM instance
-        chat_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=0.7,
-            google_api_key=os.getenv("GOOGLE_API_KEY")
-        )
+        chat_llm = get_llm()
+        chat_llm.temperature = 0.7
         
         # Build comprehensive context
         user_info = ""
@@ -298,7 +303,7 @@ Guidelines:
             request.recentTransactions
         )
         
-        # Extract insights if the request is about financial analysis
+        # Extract insights if the question is about financial analysis
         insights = None
         if any(word in request.userMessage.lower() for word in ['spending', 'expenses', 'income', 'balance', 'how much']):
             insights = analyze_quick_insights(request.userData, request.recentTransactions)
@@ -385,8 +390,16 @@ def analyze_quick_insights(user_data: Optional[UserData], transactions: List[Tra
 
 
 # -------------------------------------------------------------
-# 5. LOCAL RUN
+# 5. STARTUP & RUN
 # -------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    print("🚀 CashFlow AI is starting up...")
+    print(f"📍 Port: {os.getenv('PORT', '5001')}")
+    print(f"🔑 API Key configured: {bool(os.getenv('GOOGLE_API_KEY'))}")
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    port = int(os.getenv("PORT", 5001))
+    print(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
