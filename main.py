@@ -12,7 +12,6 @@ load_dotenv()
 # --- LangChain Imports (Updated for Gemini) ---
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 
@@ -53,9 +52,6 @@ llm = ChatGoogleGenerativeAI(
     google_api_key=os.getenv("GOOGLE_API_KEY")
 )
 
-# Use JsonOutputParser instead of with_structured_output
-parser = JsonOutputParser(pydantic_object=FinancialInsightsOutput)
-
 
 # -------------------------------------------------------------
 # 3. PROMPT TEMPLATE
@@ -89,9 +85,7 @@ You MUST respond with valid JSON matching this EXACT structure:
   "recommendations": [
     "First specific actionable step to improve finances",
     "Second specific actionable step to improve finances",
-    "Third specific actionable step to improve finances",
-    "Fourth specific actionable step (optional)",
-    "Fifth specific actionable step (optional)"
+    "Third specific actionable step to improve finances"
   ],
   "cashflowTips": [
     "First practical cash flow management tip",
@@ -107,26 +101,11 @@ IMPORTANT RULES:
 4. Be specific and actionable, avoid generic advice
 5. Focus on small business cash flow management
 
-Examples of good recommendations:
-- "Reduce discretionary spending by $X this month"
-- "Follow up on unpaid invoices over 30 days"
-- "Set aside $X for upcoming bills due in next 2 weeks"
-- "Build emergency fund to cover 3 months expenses"
-- "Review and cancel unused subscriptions"
-
-Examples of good cashflowTips:
-- "Track daily expenses in a spreadsheet or app"
-- "Set aside 10% of monthly revenue for taxes"
-- "Review all subscriptions quarterly"
-- "Negotiate net-30 payment terms with suppliers"
-- "Keep 3 months operating expenses in reserve"
-- "Send invoices immediately after service delivery"
-
 Respond ONLY with valid JSON, no additional text before or after.
 """
 
 prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-ai_chain = prompt | llm | parser
+ai_chain = prompt | llm
 
 
 # -------------------------------------------------------------
@@ -178,12 +157,27 @@ async def generate_ai_insights(data: InsightsInput):
         }
         
         # Invoke the chain
-        response_dict = await ai_chain.ainvoke(prompt_input)
+        response = await ai_chain.ainvoke(prompt_input)
+        
+        # Parse JSON from response
+        response_text = response.content
+        
+        # Remove markdown code blocks if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+        
+        response_dict = json.loads(response_text)
         
         # Validate and return
         response_object = FinancialInsightsOutput(**response_dict)
         return response_object
 
+    except json.JSONDecodeError as e:
+        print(f"JSON Parse Error: {e}")
+        print(f"Response text: {response_text}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse AI response as JSON")
     except Exception as e:
         print("AI Error:", e)
         raise HTTPException(status_code=500, detail=f"AI inference failed: {str(e)}")
@@ -243,7 +237,7 @@ async def chat_with_financial_advisor(request: ChatContextRequest):
         # Build comprehensive context
         user_info = ""
         if request.userData:
-            user_data = request.userData.dict()
+            user_data = request.userData.model_dump()
             user_info = f"""
 USER PROFILE:
 - Name: {user_data.get('name', 'User')}
@@ -269,7 +263,6 @@ Your role:
 3. Answer questions about transactions, budgeting, and cash flow
 4. Be conversational but professional
 5. Use the user's actual data when providing insights
-6. Suggest 3-5 relevant follow-up questions the user might ask
 
 Guidelines:
 - Be specific and use actual numbers from the context
@@ -305,7 +298,7 @@ Guidelines:
             request.recentTransactions
         )
         
-        # Extract insights if the question is about financial analysis
+        # Extract insights if the request is about financial analysis
         insights = None
         if any(word in request.userMessage.lower() for word in ['spending', 'expenses', 'income', 'balance', 'how much']):
             insights = analyze_quick_insights(request.userData, request.recentTransactions)
@@ -327,39 +320,30 @@ def generate_suggestions(message: str, user_data: Optional[UserData], transactio
     message_lower = message.lower()
     suggestions = []
     
-    # Balance-related suggestions
     if 'balance' in message_lower:
         suggestions.extend([
             "What are my biggest expenses this month?",
             "How can I improve my cash flow?",
             "Show me my income vs expenses"
         ])
-    
-    # Spending-related suggestions
     elif 'spend' in message_lower or 'expense' in message_lower:
         suggestions.extend([
             "Which category am I spending most on?",
             "How does this compare to last month?",
             "Give me tips to reduce expenses"
         ])
-    
-    # Income-related suggestions
     elif 'income' in message_lower or 'revenue' in message_lower:
         suggestions.extend([
             "How can I increase my revenue?",
             "What's my profit margin?",
             "Show me income trends"
         ])
-    
-    # General financial advice
     elif any(word in message_lower for word in ['advice', 'help', 'improve', 'tips']):
         suggestions.extend([
             "Analyze my financial health",
             "What should I prioritize this month?",
             "Create a budget plan for me"
         ])
-    
-    # Default suggestions
     else:
         if user_data and user_data.currentBalance is not None and user_data.currentBalance < 1000:
             suggestions.append("How can I improve my cash runway?")
@@ -370,7 +354,7 @@ def generate_suggestions(message: str, user_data: Optional[UserData], transactio
             "Give me cash flow tips"
         ])
     
-    return suggestions[:5]  # Return max 5 suggestions
+    return suggestions[:5]
 
 
 def analyze_quick_insights(user_data: Optional[UserData], transactions: List[Transaction]) -> Dict[str, Any]:
@@ -392,9 +376,8 @@ def analyze_quick_insights(user_data: Optional[UserData], transactions: List[Tra
     if user_data and user_data.currentBalance is not None:
         insights["currentBalance"] = user_data.currentBalance
         
-        # Calculate runway (days until money runs out)
         if total_expenses > 0:
-            daily_burn = total_expenses / 30  # Assume 30 days
+            daily_burn = total_expenses / 30
             runway_days = int(user_data.currentBalance / daily_burn) if daily_burn > 0 else 999
             insights["runwayDays"] = runway_days
     
@@ -405,4 +388,5 @@ def analyze_quick_insights(user_data: Optional[UserData], transactions: List[Tra
 # 5. LOCAL RUN
 # -------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=5000)
+    port = int(os.getenv("PORT", 5000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
